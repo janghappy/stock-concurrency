@@ -60,7 +60,7 @@ docker run -d -p 3306:3306 -e MYSQL_ROOT_PASSWORD=1234 --name mysql mysql
 docker exec -it mysql mysql -uroot -p1234 -e "CREATE DATABASE stock_example;"
 ```
 
-### 2. Redis 실행 (6·7단계부터)
+### 2. Redis 실행 (5·6단계부터)
 
 ```bash
 sudo apt install redis-server        # 최초 1회
@@ -88,7 +88,7 @@ cp src/main/resources/application.yaml.example \
 ./gradlew test
 ```
 
-> 테스트는 실제 MySQL(·Redis)에 붙는 `@SpringBootTest`이므로 1~3단계가 먼저 되어 있어야 한다.
+> 테스트는 실제 MySQL(·Redis)에 붙는 `@SpringBootTest`이므로 위 1~3번이 먼저 되어 있어야 한다.
 
 ## 동시성 테스트 방식
 
@@ -102,7 +102,7 @@ cp src/main/resources/application.yaml.example \
 
 각 단계를 구현하면서 아래에 정리한다. 강의 소스와 다르게 구현한 부분은 차이점과 이유를 함께 적는다.
 
-### 1. 재고 감소 로직과 Race Condition
+### 0. 재고 감소 로직과 Race Condition
 
 - `Stock.decrease()`: 남는 수량이 0 미만이면 예외를 던지고, 아니면 수량을 차감한다.
 - `StockService.decrease()`: `@Transactional` 안에서 `findById` → `decrease` → `saveAndFlush`.
@@ -121,7 +121,7 @@ cp src/main/resources/application.yaml.example \
 
 > `runAsync`에 풀을 넘기지 않으면 공용 ForkJoinPool(동시 실행 수 = CPU 코어 수 − 1)을 쓰게 되어 경합이 약해지므로 반드시 넘긴다.
 
-### 2. `synchronized`
+### 1. `synchronized`
 
 `StockService.decrease()`에 `synchronized`를 붙여 한 번에 한 스레드만 `조회 → 감소 → 저장`을 실행하게 한다.
 `@Transactional`은 제거하고(주석 처리), `saveAndFlush`로 변경을 직접 반영한다.
@@ -152,23 +152,23 @@ cp src/main/resources/application.yaml.example \
 | 단점 | 락 단위가 **빈 인스턴스(`this`) 전체**라, 상품 1의 재고 감소가 상품 2의 재고 감소까지 막는다. 상품이 많을수록 처리량이 떨어진다. |
 | 단점 | 락 대기 타임아웃이나 공정성(fairness)을 제어할 수 없다. |
 
-### 3. Pessimistic Lock
+### 2. Pessimistic Lock
 
 _예정_ — `@Lock(LockModeType.PESSIMISTIC_WRITE)` 조회 (`SELECT ... FOR UPDATE`)
 
-### 4. Optimistic Lock
+### 3. Optimistic Lock
 
 _예정_ — `@Version` + `@Lock(LockModeType.OPTIMISTIC)`, 충돌 시 Facade에서 대기 후 재시도
 
-### 5. Named Lock
+### 4. Named Lock
 
 _예정_ — `GET_LOCK` / `RELEASE_LOCK`, 락 획득·해제와 재고 감소의 트랜잭션 분리(`REQUIRES_NEW`)
 
-### 6. Redis — Lettuce
+### 5. Redis — Lettuce
 
 _예정_ — `SETNX` spin lock, 획득 실패 시 잠시 대기 후 재시도
 
-### 7. Redis — Redisson
+### 6. Redis — Redisson
 
 _예정_ — `RLock.tryLock(대기 시간, 점유 시간)`, pub/sub 기반
 
