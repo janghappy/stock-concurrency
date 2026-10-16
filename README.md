@@ -1,18 +1,15 @@
-# 재고시스템으로 알아보는 동시성이슈 해결방법
+# 재고시스템으로 알아보는 동시성이슈 해결방법 — synchronized
 
-재고(stock)를 감소시키는 단순한 로직에 여러 요청이 동시에 들어오면 재고가 어떻게 어긋나는지 확인하고,
-Java·Database·Redis를 이용한 동시성 제어 방법을 차례로 구현하며 비교한다.
+재고 감소 로직에 동시 요청이 몰릴 때 생기는 Race Condition을 Java `synchronized`로 해결한다.
 
-- 프로젝트 목적·요구사항·기술 스펙·구조·실행 방법·구현 상세는 [프로젝트 설명](docs/project.md)에 정리했다.
-- 강의: [인프런 — 재고시스템으로 알아보는 동시성이슈 해결방법](https://www.inflearn.com/course/%EB%8F%99%EC%8B%9C%EC%84%B1%EC%9D%B4%EC%8A%88-%EC%9E%AC%EA%B3%A0%EC%8B%9C%EC%8A%A4%ED%85%9C/dashboard?cid=328995)
-- 강의 소스: [sangyongchoi/stock-example](https://github.com/sangyongchoi/stock-example)
+- 이 브랜치(`sync`)는 `synchronized` 단계까지의 결과물이다. 이후 단계(DB 락, Redis 락)는 `main` 브랜치에서 진행한다.
+- 실행 방법·테스트 방식은 [프로젝트 설명](docs/project.md)에 정리했다.
+- 강의: [인프런 — 재고시스템으로 알아보는 동시성이슈 해결방법](https://www.inflearn.com/course/%EB%8F%99%EC%8B%9C%EC%84%B1%EC%9D%B4%EC%8A%88-%EC%9E%AC%EA%B3%A0%EC%8B%9C%EC%8A%A4%ED%85%9C/dashboard?cid=328995) / 강의 소스: [sangyongchoi/stock-example](https://github.com/sangyongchoi/stock-example)
 
-## 동시성 이슈란 (Race Condition)
+## 문제: Race Condition
 
-- 둘 이상의 스레드가 **공유 데이터(재고)에 동시에 접근해 변경**하려 할 때 발생한다.
-- 재고 감소는 `조회 → 감소 → 저장` 세 단계로 이루어지는데, 한 스레드의 저장이 끝나기 전에 다른 스레드가 조회하면
-  두 스레드가 같은 값을 읽고 각각 1씩 빼서 저장하므로 **감소가 한 번 사라진다(갱신 손실)**.
-- 그래서 재고 100개에 100건을 동시에 요청해도 재고가 0이 되지 않는다.
+재고 감소는 `조회 → 감소 → 저장` 순서로 실행된다. 두 스레드가 같은 값을 읽고 각자 저장하면 감소분 하나가 사라진다.
+그래서 재고 100개에 100건을 동시에 요청해도 0이 되지 않는다(예: `expected: <0> but was: <90>`).
 
 ```mermaid
 sequenceDiagram
@@ -22,36 +19,43 @@ sequenceDiagram
 
     T1->>DB: 조회 (5)
     T2->>DB: 조회 (5)
-    Note over T1: 5 - 1 = 4
-    Note over T2: 5 - 1 = 4
     T1->>DB: 저장 (4)
     T2->>DB: 저장 (4)
     Note over DB: 기대값 3, 실제값 4 → 감소 1건 유실
 ```
 
-해결의 핵심은 **한 번에 하나의 스레드만 `조회 → 감소 → 저장` 구간에 들어가도록** 하는 것이다.
+## 해결: `synchronized`
 
-## 해결 방법 비교
+`StockService.decrease()`에 `synchronized`를 붙여 한 번에 한 스레드만 `조회 → 감소 → 저장`을 실행하게 한다.
 
-| 방법 | 방식 | 장점 | 단점 / 주의점 |
-|---|---|---|---|
-| `synchronized` | Java 언어 수준의 락 | 구현이 가장 간단 | 한 프로세스 안에서만 보장 → **서버가 2대 이상이면 무용**. `@Transactional`과 함께 쓰면 커밋 전에 락이 풀려 여전히 깨진다. |
-| Pessimistic Lock | DB 행에 배타 락 (`SELECT ... FOR UPDATE`) | 충돌이 잦을 때 Optimistic보다 성능이 나을 수 있고, 정합성이 확실함 | 락 대기로 인한 성능 저하, 데드락 주의 |
-| Optimistic Lock | `@Version` 컬럼으로 갱신 시 충돌 감지 | 별도 락을 잡지 않아 충돌이 적으면 빠름 | 충돌 시 **재시도 로직을 직접 구현**해야 함, 충돌이 잦으면 오히려 느림 |
-| Named Lock | MySQL `GET_LOCK` / `RELEASE_LOCK` (이름 기반 락) | 행이 아닌 임의의 이름에 락 → 분산 락 용도로 활용 가능 | 트랜잭션 종료 시 자동 해제되지 않아 **직접 해제**해야 함, 락 전용 커넥션 분리 권장 |
-| Redis — Lettuce | `SETNX` 기반 spin lock | 구현이 간단, 기본 Redis 클라이언트 | 락을 얻을 때까지 계속 재요청 → **Redis 부하** |
-| Redis — Redisson | pub/sub 기반 락 | 락 해제 시 알림을 받아 재시도 → Redis 부하가 적음, 락 획득 재시도·타임아웃 기본 제공 | 별도 라이브러리 필요, 사용법을 익혀야 함 |
+```java
+//    @Transactional
+public synchronized void decrease(Long id, Long quantity){
+    Stock stock = stockRepository.findById(id).orElseThrow();
+    stock.decrease(quantity);
 
-## 진행 상황
+    stockRepository.saveAndFlush(stock);
+}
+```
 
-| 단계 | 내용 | 상태 |
-|---|---|---|
-| 1 | 재고 감소 로직 작성 + 동시 요청 테스트로 Race Condition 확인 | 완료 |
-| 2 | `synchronized`로 해결과 한계 확인 | 완료 |
-| 3 | Pessimistic Lock | 예정 |
-| 4 | Optimistic Lock (+ 재시도 Facade) | 예정 |
-| 5 | Named Lock | 예정 |
-| 6 | Redis — Lettuce | 예정 |
-| 7 | Redis — Redisson | 예정 |
+### 주의: `@Transactional`을 유지하면 해결되지 않는다
 
-각 단계를 구현하면 상태를 갱신하고, 구현 상세는 [프로젝트 설명](docs/project.md#구현-상세)에 기록한다.
+트랜잭션은 Spring 프록시가 메서드 **바깥**에서 시작하고 커밋한다.
+
+```
+프록시: 트랜잭션 시작
+  └── decrease()   ← synchronized 락 구간
+프록시: 커밋         ← 락이 이미 풀린 뒤
+```
+
+락이 풀린 뒤 커밋되기 전에 다른 스레드가 들어오면, 커밋되지 않은 이전 수량을 읽어 다시 감소분이 유실된다.
+그래서 `@Transactional`을 제거한다. 트랜잭션이 없으면 변경 감지가 동작하지 않으므로 `saveAndFlush`로 직접 저장한다.
+
+### 장단점
+
+| 장점 | 단점 |
+|---|---|
+| 키워드 하나로 끝날 만큼 **단순**하다. | **JVM 로컬 락**이다. 서버가 2대 이상이면 서로의 락을 모르므로 보장되지 않는다. |
+| DB 락·Redis 같은 추가 인프라가 필요 없다. | `@Transactional`을 쓸 수 없어 다른 작업과 하나의 트랜잭션으로 묶을 수 없다. |
+| 서버가 1대라면 확실히 직렬화된다. | 락 단위가 빈 인스턴스 전체라, 상품 1의 감소가 상품 2의 감소까지 막는다. |
+| | 락 대기 타임아웃이나 공정성을 제어할 수 없다. |
