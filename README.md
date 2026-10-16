@@ -44,14 +44,14 @@ sequenceDiagram
 
 ## 진행 상황
 
-| 단계 | 내용 | 상태 |
-|---|---|---|
-| 1 | 재고 감소 로직 작성 + 동시 요청 테스트로 Race Condition 확인 | 완료 |
-| 2 | `synchronized`로 해결과 한계 확인 | 완료 |
-| 3 | Pessimistic Lock | 예정 |
-| 4 | Optimistic Lock (+ 재시도 Facade) | 예정 |
-| 5 | Named Lock | 예정 |
-| 6 | Redis — Lettuce | 예정 |
-| 7 | Redis — Redisson | 예정 |
+| 단계 | 내용 | 상태 | 브랜치 |
+|---|---|---|---|
+| 0 | 재고 감소 로직 작성 + 동시 요청 테스트로 Race Condition 확인 | 완료 | — |
+| 1 | `synchronized`로 해결과 한계 확인 | 완료 | [`step1-synchronized`](../../tree/step1-synchronized) |
+| 2 | Pessimistic Lock | 예정 | |
+| 3 | Optimistic Lock (+ 재시도 Facade) | 예정 | |
+| 4 | Named Lock | 예정 | |
+| 5 | Redis — Lettuce | 예정 | |
+| 6 | Redis — Redisson | 예정 | |
 
-각 단계를 구현하면 상태를 갱신하고, 구현 상세는 [프로젝트 설명](docs/project.md#구현-상세)에 기록한다.
+각 단계를 구현하면 상태를 갱신하고 `stepN-방법` 브랜치로 결과를 남기며, 구현 상세는 [프로젝트 설명](docs/project.md#구현-상세)에 기록한다.
