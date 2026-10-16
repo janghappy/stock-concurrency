@@ -60,7 +60,7 @@ docker run -d -p 3306:3306 -e MYSQL_ROOT_PASSWORD=1234 --name mysql mysql
 docker exec -it mysql mysql -uroot -p1234 -e "CREATE DATABASE stock_example;"
 ```
 
-### 2. Redis 실행 (5·6단계부터)
+### 2. Redis 실행 (3단계부터)
 
 ```bash
 sudo apt install redis-server        # 최초 1회
@@ -121,7 +121,7 @@ cp src/main/resources/application.yaml.example \
 
 > `runAsync`에 풀을 넘기지 않으면 공용 ForkJoinPool(동시 실행 수 = CPU 코어 수 − 1)을 쓰게 되어 경합이 약해지므로 반드시 넘긴다.
 
-### 1. `synchronized`
+### 1. Java — `synchronized`
 
 `StockService.decrease()`에 `synchronized`를 붙여 한 번에 한 스레드만 `조회 → 감소 → 저장`을 실행하게 한다.
 `@Transactional`은 제거하고(주석 처리), `saveAndFlush`로 변경을 직접 반영한다.
@@ -152,7 +152,9 @@ cp src/main/resources/application.yaml.example \
 | 단점 | 락 단위가 **빈 인스턴스(`this`) 전체**라, 상품 1의 재고 감소가 상품 2의 재고 감소까지 막는다. 상품이 많을수록 처리량이 떨어진다. |
 | 단점 | 락 대기 타임아웃이나 공정성(fairness)을 제어할 수 없다. |
 
-### 2. Pessimistic Lock
+### 2. Database
+
+#### 2-1. Pessimistic Lock
 
 재고를 조회할 때 DB 행에 **배타 락**을 걸어, 락을 잡은 트랜잭션이 커밋할 때까지 다른 트랜잭션이 같은 행을 읽어 수정하지 못하게 한다.
 
@@ -193,7 +195,7 @@ select ... from stock stock0_ where stock0_.id=? for update
 | 단점 | 여러 행을 서로 다른 순서로 잠그면 **데드락**이 날 수 있다. |
 | 단점 | 기본 대기 시간이 길다(MySQL `innodb_lock_wait_timeout` 기본 50초). 필요하면 `@QueryHints`의 `javax.persistence.lock.timeout`으로 조정한다. |
 
-### 3. Optimistic Lock
+#### 2-2. Optimistic Lock
 
 락을 잡지 않고, **버전 컬럼**으로 갱신 시점에 충돌을 감지한다. 충돌하면 예외가 나므로 **재시도를 직접 구현**해야 한다.
 
@@ -257,15 +259,17 @@ Facade가 `catch (Exception e)`로 모든 예외를 잡아 재시도한다. 재�
 | 단점 | **충돌이 잦으면** 실패한 트랜잭션과 재시도가 쌓여 Pessimistic Lock보다 느려진다. 이 테스트처럼 한 행에 요청이 몰리는 경우가 그렇다. |
 | 단점 | 버전 컬럼을 추가하는 등 엔티티 변경이 필요하다. |
 
-### 4. Named Lock
+#### 2-3. Named Lock
 
 _예정_ — `GET_LOCK` / `RELEASE_LOCK`, 락 획득·해제와 재고 감소의 트랜잭션 분리(`REQUIRES_NEW`)
 
-### 5. Redis — Lettuce
+### 3. Redis
+
+#### 3-1. Lettuce
 
 _예정_ — `SETNX` spin lock, 획득 실패 시 잠시 대기 후 재시도
 
-### 6. Redis — Redisson
+#### 3-2. Redisson
 
 _예정_ — `RLock.tryLock(대기 시간, 점유 시간)`, pub/sub 기반
 
