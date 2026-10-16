@@ -195,7 +195,67 @@ select ... from stock stock0_ where stock0_.id=? for update
 
 ### 3. Optimistic Lock
 
-_예정_ — `@Version` + `@Lock(LockModeType.OPTIMISTIC)`, 충돌 시 Facade에서 대기 후 재시도
+락을 잡지 않고, **버전 컬럼**으로 갱신 시점에 충돌을 감지한다. 충돌하면 예외가 나므로 **재시도를 직접 구현**해야 한다.
+
+```java
+// Stock
+@Version
+private Long version;
+
+// StockRepository
+@Lock(LockModeType.OPTIMISTIC)
+@Query("select s from Stock s where s.id = :id")
+Stock findByIdWithOptimisticLock(Long id);
+
+// OptimisticLockStockService — 한 번 시도하는 트랜잭션
+@Transactional
+public void decrease(Long id, Long quantity) {
+    Stock stock = stockRepository.findByIdWithOptimisticLock(id);
+    stock.decrease(quantity);
+    stockRepository.save(stock);
+}
+
+// OptimisticLockStockFacade — 실패하면 50ms 쉬고 다시 시도
+public void decrease(Long id, Long quantity) throws InterruptedException {
+    while (true) {
+        try {
+            optimisticLockStockService.decrease(id, quantity);
+            break;
+        } catch (Exception e) {
+            Thread.sleep(50);
+        }
+    }
+}
+```
+
+실행되는 쿼리 (테스트 로그):
+
+```sql
+select ..., stock0_.version from stock stock0_ where stock0_.id=?           -- 일반 조회 (락 없음)
+update stock set product_id=?, quantity=?, version=? where id=? and version=?   -- 읽은 버전일 때만 갱신, 버전 +1
+select version as version_ from stock where id =?                          -- LockModeType.OPTIMISTIC: 커밋 전 버전 재확인
+```
+
+- 다른 트랜잭션이 먼저 갱신해 버전이 바뀌었으면 UPDATE 결과가 0건이 되고, `ObjectOptimisticLockingFailureException`이 난다.
+- **재시도는 트랜잭션 바깥(Facade)에서** 한다. 같은 트랜잭션 안에서 다시 조회하면 영속성 컨텍스트에 남은 옛 엔티티(옛 버전)를 그대로 받아 계속 실패한다. 그래서 서비스(트랜잭션 1회)와 Facade(재시도 루프)를 나눴다.
+- `@Lock(LockModeType.OPTIMISTIC)` 없이 `@Version`만 있어도 UPDATE의 버전 비교는 동작한다. `OPTIMISTIC`은 커밋 직전 버전 재확인 쿼리를 추가한다.
+- 테스트는 `facade/OptimisticLockStockFacadeTest`로 Facade를 대상으로 한다. 실행 시간은 약 5.4초로, Pessimistic Lock(약 1.4초, 테스트 2개)보다 길다. 100건이 한 행에 몰려 충돌·재시도가 많기 때문이다.
+
+**주의: 모든 예외를 재시도한다 (강의 코드 그대로)**
+
+Facade가 `catch (Exception e)`로 모든 예외를 잡아 재시도한다. 재고 부족(`재고는 0개 미만이 될 수 없습니다.`)처럼 다시 시도해도 결과가 같은 예외도 **무한 반복**된다.
+실무라면 `ObjectOptimisticLockingFailureException`만 재시도하고, 최대 재시도 횟수를 둬야 한다. (테스트는 `orTimeout(10초)`가 있어 무한 대기하지는 않는다.)
+
+**장단점**
+
+| 구분 | 내용 |
+|---|---|
+| 장점 | DB 락을 잡지 않으므로 **충돌이 드물면** 대기 없이 빠르다. |
+| 장점 | 락 대기로 DB 커넥션을 붙잡지 않고, 데드락 걱정이 없다. |
+| 장점 | DB 버전 컬럼으로 판단하므로 **서버가 여러 대여도 동작**한다. |
+| 단점 | 충돌 시 **재시도 로직을 직접 구현**해야 한다(Facade, 대기 시간, 재시도할 예외·횟수). |
+| 단점 | **충돌이 잦으면** 실패한 트랜잭션과 재시도가 쌓여 Pessimistic Lock보다 느려진다. 이 테스트처럼 한 행에 요청이 몰리는 경우가 그렇다. |
+| 단점 | 버전 컬럼을 추가하는 등 엔티티 변경이 필요하다. |
 
 ### 4. Named Lock
 
