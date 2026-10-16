@@ -46,7 +46,7 @@ sequenceDiagram
 
 | 단계 | 내용 | 상태 |
 |---|---|---|
-| 1 | 재고 감소 로직 작성 + 동시 요청 테스트로 Race Condition 확인 | 예정 |
+| 1 | 재고 감소 로직 작성 + 동시 요청 테스트로 Race Condition 확인 | 완료 |
 | 2 | `synchronized`로 해결과 한계 확인 | 예정 |
 | 3 | Pessimistic Lock | 예정 |
 | 4 | Optimistic Lock (+ 재시도 Facade) | 예정 |
