@@ -2,7 +2,7 @@
 
 재고 감소 로직에 동시 요청이 몰릴 때 생기는 Race Condition을 Java `synchronized`로 해결한다.
 
-- 이 브랜치(`sync`)는 `synchronized` 단계까지의 결과물이다. 이후 단계(DB 락, Redis 락)는 `main` 브랜치에서 진행한다.
+- 이 브랜치(`step1-java-synchronized`)는 `synchronized` 단계까지의 결과물이다. 이후 단계(DB 락, Redis 락)는 `main` 브랜치에서 진행한다.
 - 실행 방법·테스트 방식은 [프로젝트 설명](docs/project.md)에 정리했다.
 - 강의: [인프런 — 재고시스템으로 알아보는 동시성이슈 해결방법](https://www.inflearn.com/course/%EB%8F%99%EC%8B%9C%EC%84%B1%EC%9D%B4%EC%8A%88-%EC%9E%AC%EA%B3%A0%EC%8B%9C%EC%8A%A4%ED%85%9C/dashboard?cid=328995) / 강의 소스: [sangyongchoi/stock-example](https://github.com/sangyongchoi/stock-example)
 
