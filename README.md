@@ -48,7 +48,7 @@ sequenceDiagram
 |---|---|---|---|
 | 0 | 재고 감소 로직 작성 + 동시 요청 테스트로 Race Condition 확인 | 완료 | — |
 | 1 | `synchronized`로 해결과 한계 확인 | 완료 | [`step1-synchronized`](../../tree/step1-synchronized) |
-| 2 | Pessimistic Lock | 예정 | |
+| 2 | Pessimistic Lock | 완료 | [`step2-pessimistic-lock`](../../tree/step2-pessimistic-lock) |
 | 3 | Optimistic Lock (+ 재시도 Facade) | 예정 | |
 | 4 | Named Lock | 예정 | |
 | 5 | Redis — Lettuce | 예정 | |
