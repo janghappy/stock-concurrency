@@ -44,14 +44,14 @@ sequenceDiagram
 
 ## 진행 상황
 
-| 단계 | 내용 | 상태 | 브랜치 |
-|---|---|---|---|
-| 0 | 재고 감소 로직 작성 + 동시 요청 테스트로 Race Condition 확인 | 완료 | — |
-| 1 | `synchronized`로 해결과 한계 확인 | 완료 | [`step1-synchronized`](../../tree/step1-synchronized) |
-| 2 | Pessimistic Lock | 완료 | [`step2-pessimistic-lock`](../../tree/step2-pessimistic-lock) |
-| 3 | Optimistic Lock (+ 재시도 Facade) | 완료 | [`step3-optimistic-lock`](../../tree/step3-optimistic-lock) |
-| 4 | Named Lock | 예정 | |
-| 5 | Redis — Lettuce | 예정 | |
-| 6 | Redis — Redisson | 예정 | |
+| 단계 | 수준 | 내용 | 상태 | 브랜치 |
+|---|---|---|---|---|
+| 0 | — | 재고 감소 로직 작성 + 동시 요청 테스트로 Race Condition 확인 | 완료 | — |
+| 1 | Java | `synchronized`로 해결과 한계 확인 | 완료 | [`step1-java-synchronized`](../../tree/step1-java-synchronized) |
+| 2-1 | DB | Pessimistic Lock | 완료 | [`step2-1-db-pessimistic-lock`](../../tree/step2-1-db-pessimistic-lock) |
+| 2-2 | DB | Optimistic Lock (+ 재시도 Facade) | 완료 | [`step2-2-db-optimistic-lock`](../../tree/step2-2-db-optimistic-lock) |
+| 2-3 | DB | Named Lock | 예정 | |
+| 3-1 | Redis | Lettuce | 예정 | |
+| 3-2 | Redis | Redisson | 예정 | |
 
-각 단계를 구현하면 상태를 갱신하고 `stepN-방법` 브랜치로 결과를 남기며, 구현 상세는 [프로젝트 설명](docs/project.md#구현-상세)에 기록한다.
+각 단계를 구현하면 상태를 갱신하고 `step{수준}-{하위 번호}-{수준명}-{방법}` 브랜치로 결과를 남기며, 구현 상세는 [프로젝트 설명](docs/project.md#구현-상세)에 기록한다.
