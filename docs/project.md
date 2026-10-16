@@ -94,8 +94,8 @@ cp src/main/resources/application.yaml.example \
 
 모든 방법을 같은 조건으로 검증한다.
 
-- `@BeforeEach`: 재고 100개짜리 상품 저장 / `@AfterEach`: 전체 삭제
-- `ExecutorService`(스레드 32개)로 재고 1개 감소 요청 100건을 동시에 보내고, `CountDownLatch(100)`로 모두 끝날 때까지 기다린다.
+- `@BeforeEach`: 재고 100개짜리 상품을 저장하고 그 `id`를 `stockId`에 보관 / `@AfterEach`: 전체 삭제
+- 스레드 32개짜리 `ExecutorService` 위에서 `CompletableFuture.runAsync`로 재고 1개 감소 요청 100건을 동시에 보내고, `allOf(...).orTimeout(10초).join()`으로 모두 끝날 때까지 기다린다.
 - 남은 재고가 **0**인지 확인한다. (동시성 제어가 없으면 0보다 큰 값이 남아 실패한다.)
 
 ## 구현 상세
@@ -104,7 +104,22 @@ cp src/main/resources/application.yaml.example \
 
 ### 1. 재고 감소 로직과 Race Condition
 
-_예정_
+- `Stock.decrease()`: 남는 수량이 0 미만이면 예외를 던지고, 아니면 수량을 차감한다.
+- `StockService.decrease()`: `@Transactional` 안에서 `findById` → `decrease` → `saveAndFlush`.
+  트랜잭션 안에서는 변경 감지로 UPDATE가 나가므로 `saveAndFlush`가 꼭 필요하지는 않다.
+  다만 다음 단계(`synchronized`)에서 `@Transactional`을 떼면 엔티티가 준영속 상태가 되어 `save`가 필요해지므로 강의처럼 남겨 둔다.
+- 결과: `재고감소`(단건)는 통과하고, `동시에_100개의_요청`은 **실패**한다(예: `expected: <0> but was: <90>`).
+  동시성 제어가 없어 여러 스레드가 같은 수량을 읽고 각자 저장하면서 감소분이 유실된다. 남는 값은 실행할 때마다 다르다.
+
+**강의 소스와 다른 점 (테스트)**
+
+| 항목 | 강의 | 이 프로젝트 | 이유 |
+|---|---|---|---|
+| 조회 id | `findById(1L)` 고정 | `@BeforeEach`에서 저장한 `stockId` | `deleteAll()`은 AUTO_INCREMENT를 초기화하지 않아, 클래스 전체를 실행하면 두 번째 테스트부터 id가 2 이상이 된다. |
+| 동시 실행 | `ExecutorService` + `CountDownLatch` | `CompletableFuture.runAsync(..., executorService)` + `allOf().join()` | 더 간결하고, 스레드 안의 예외가 `join()`에서 드러난다. (`submit()`은 예외를 `Future`에 담아 두고 아무도 꺼내지 않으므로 묻힌다.) |
+| 대기 제한 | 없음 (`latch.await()`) | `orTimeout(10, SECONDS)` + `finally`에서 `shutdown()` | 락 구현 버그로 데드락이 나도 테스트가 무한정 멈추지 않게 한다. |
+
+> `runAsync`에 풀을 넘기지 않으면 공용 ForkJoinPool(동시 실행 수 = CPU 코어 수 − 1)을 쓰게 되어 경합이 약해지므로 반드시 넘긴다.
 
 ### 2. `synchronized`
 
