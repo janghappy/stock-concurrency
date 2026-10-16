@@ -36,7 +36,7 @@
 
 ## 프로젝트 구조
 
-현재는 Spring Boot 기본 골격(`StockApplication`)만 있다. 아래는 강의 소스 기준으로 만들어 갈 구조이며, 구현하면서 갱신한다.
+강의 소스 기준으로 만들어 갈 구조이며, 구현하면서 갱신한다. 테스트는 방법(서비스·Facade)마다 `XxxTest` 클래스를 따로 둔다.
 
 ```
 stock-concurrency
@@ -154,7 +154,44 @@ cp src/main/resources/application.yaml.example \
 
 ### 2. Pessimistic Lock
 
-_예정_ — `@Lock(LockModeType.PESSIMISTIC_WRITE)` 조회 (`SELECT ... FOR UPDATE`)
+재고를 조회할 때 DB 행에 **배타 락**을 걸어, 락을 잡은 트랜잭션이 커밋할 때까지 다른 트랜잭션이 같은 행을 읽어 수정하지 못하게 한다.
+
+```java
+// StockRepository
+@Lock(LockModeType.PESSIMISTIC_WRITE)
+@Query("select s from Stock s where s.id = :id")
+Stock findByIdWithPessimisticLock(Long id);
+
+// PessimisticLockStockService
+@Transactional
+public void decrease(Long id, Long quantity) {
+    Stock stock = stockRepository.findByIdWithPessimisticLock(id);
+    stock.decrease(quantity);
+    stockRepository.save(stock);
+}
+```
+
+실행되는 쿼리 (테스트 로그):
+
+```sql
+select ... from stock stock0_ where stock0_.id=? for update
+```
+
+- 락은 **트랜잭션이 끝날 때(커밋·롤백) DB가 해제**한다. `synchronized`와 달리 락 구간이 커밋까지 포함되므로 `@Transactional`을 그대로 쓴다.
+- `@Transactional` 안이므로 `save`는 없어도 변경 감지로 반영된다. 강의 코드처럼 남겨 두었다.
+- 테스트는 `PessimisticLockStockServiceTest`로 분리했다. `StockServiceTest`와 같은 내용이며 대상 서비스만 다르다.
+
+**장단점**
+
+| 구분 | 내용 |
+|---|---|
+| 장점 | 락을 DB가 관리하므로 **서버가 여러 대여도 동작**한다. |
+| 장점 | 락 단위가 **행**이라, 다른 상품의 재고 감소는 막지 않는다. |
+| 장점 | 충돌이 잦을 때는 재시도가 반복되는 Optimistic Lock보다 성능이 나을 수 있다. |
+| 장점 | `@Transactional`과 함께 쓸 수 있고, 별도 재시도 로직 없이 정합성이 확실하다. |
+| 단점 | 락을 기다리는 동안 트랜잭션과 DB 커넥션을 붙잡고 있어 **처리량이 떨어진다.** 트랜잭션이 길수록 심해진다. |
+| 단점 | 여러 행을 서로 다른 순서로 잠그면 **데드락**이 날 수 있다. |
+| 단점 | 기본 대기 시간이 길다(MySQL `innodb_lock_wait_timeout` 기본 50초). 필요하면 `@QueryHints`의 `javax.persistence.lock.timeout`으로 조정한다. |
 
 ### 3. Optimistic Lock
 
