@@ -10,6 +10,8 @@ spring:
     url:
     username:
     password:
+    hikari:
+      maximum-pool-size: 40   # Named Lock: 요청 1건이 커넥션 2개(락용 + 재고 감소용)를 사용
 
 logging:
   level:

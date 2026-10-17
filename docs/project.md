@@ -80,7 +80,7 @@ cp src/main/resources/application.yaml.example \
 ```
 
 - `spring.jpa.hibernate.ddl-auto: create` — 기동할 때마다 테이블을 새로 만든다.
-- Named Lock 단계에서는 락용 커넥션을 따로 쓰므로 `spring.datasource.hikari.maximum-pool-size`를 넉넉히(예: 40) 늘린다.
+- `spring.datasource.hikari.maximum-pool-size: 40` — Named Lock은 요청 1건이 커넥션 2개를 쓰므로 기본값(10)보다 늘려 둔다. example 파일에 이미 들어 있다.
 
 ### 4. 테스트 실행
 
@@ -261,7 +261,84 @@ Facade가 `catch (Exception e)`로 모든 예외를 잡아 재시도한다. 재�
 
 #### 2-3. Named Lock
 
-_예정_ — `GET_LOCK` / `RELEASE_LOCK`, 락 획득·해제와 재고 감소의 트랜잭션 분리(`REQUIRES_NEW`)
+MySQL의 `GET_LOCK` / `RELEASE_LOCK`으로 **이름(문자열)에 락**을 건다. 행이 아니라 임의의 이름을 잠그므로, 잠글 행이 없는 경우(중복 생성 방지, 배치 중복 실행 방지)에도 쓸 수 있다.
+
+```java
+// LockRepository — 네이티브 쿼리 (timeout은 초 단위, 반환값 1: 획득, 0: 타임아웃, null: 오류)
+@Query(value = "select get_lock(:key, 3)", nativeQuery = true)
+Long getLock(String key);
+
+@Query(value = "select release_lock(:key)", nativeQuery = true)
+Long releaseLock(String key);
+
+// NamedLockStockFacade — 락 획득 → 재고 감소 → 락 해제
+@Transactional
+public void decrease(Long id, Long quantity) {
+    String key = id.toString();
+
+    Long acquired = lockRepository.getLock(key);
+    if (acquired == null || acquired != 1L) {
+        throw new IllegalStateException("락 획득에 실패했습니다. key=" + key);
+    }
+
+    try {
+        namedLockStockService.decrease(id, quantity);
+    } finally {
+        lockRepository.releaseLock(key);
+    }
+}
+
+// NamedLockStockService — 별도 트랜잭션
+@Transactional(propagation = Propagation.REQUIRES_NEW)
+public void decrease(Long id, Long quantity) {
+    Stock stock = stockRepository.findById(id).orElseThrow();
+    stock.decrease(quantity);
+    stockRepository.save(stock);
+}
+```
+
+**특이점 1: 재고 감소는 `REQUIRES_NEW`로 별도 트랜잭션에서 실행한다**
+
+| 구성 | 역할 | 커넥션 |
+|---|---|---|
+| Facade `@Transactional` | `GET_LOCK` → 서비스 호출 → `RELEASE_LOCK` | A |
+| Service `REQUIRES_NEW` | 재고 조회·감소, **메서드가 끝날 때 커밋** | B (새로 받음) |
+
+- `GET_LOCK`은 **세션(커넥션) 단위** 락이다. 획득과 해제가 같은 커넥션에서 실행돼야 하므로 Facade에 `@Transactional`을 붙여 커넥션 A를 고정한다.
+  트랜잭션이 없으면 쿼리마다 다른 커넥션을 쓸 수 있어, 락을 잡지 않은 커넥션에서 `RELEASE_LOCK`을 호출하게 된다.
+- 서비스가 Facade 트랜잭션에 합류하면(`REQUIRED`) 커밋은 Facade가 끝날 때 일어나는데, `finally`의 `RELEASE_LOCK`이 그보다 먼저 실행된다.
+  그러면 `synchronized` 단계와 같은 문제(락 해제 → 커밋 전에 다른 요청이 이전 수량을 읽음)가 생긴다.
+  `REQUIRES_NEW`로 분리하면 서비스가 반환될 때 이미 커밋되어 있으므로, 락 해제 후 들어온 요청은 반영된 값을 읽는다.
+- 강의는 `StockService`에 `REQUIRES_NEW`를 붙여 재사용하지만, 이 프로젝트는 `synchronized` 단계 결과를 보존하려고 `NamedLockStockService`를 따로 만들었다.
+
+**특이점 2: 커넥션 풀 고갈에 대비해 풀 크기를 늘린다**
+
+- 요청 1건이 커넥션을 **2개**(A: 락, B: 재고 감소) 쓴다. 락을 기다리는 요청도 커넥션 A를 붙잡은 채 대기한다.
+- 풀이 작으면(기본 10) 대기 중인 요청들이 커넥션을 모두 차지해, 락을 잡은 요청이 커넥션 B를 받지 못하고 멈춘다(커넥션 풀 데드락).
+  그래서 `spring.datasource.hikari.maximum-pool-size: 40`으로 늘렸다. (테스트 스레드 32개 → 최대 64개가 필요할 수 있지만, 락 대기 중인 요청은 B를 요청하지 않으므로 40이면 충분하다.)
+- 실무에서는 락 전용 `DataSource`를 따로 두어 비즈니스 쿼리용 풀과 분리하는 것을 권장한다.
+
+**강의 코드와 다른 점 (락 획득)**
+
+| 항목 | 강의 | 이 프로젝트 | 이유 |
+|---|---|---|---|
+| 타임아웃 | `get_lock(:key, 3000)` | `get_lock(:key, 3)` | 두 번째 인자는 **초 단위**라 `3000`은 50분이다. 의도대로 3초로 맞췄다. |
+| 반환값 | `void` (버림) | `Long`으로 받아 `1`이 아니면 `IllegalStateException` | 반환값을 버리면 타임아웃으로 락을 못 얻어도 그대로 재고를 감소시켜, 락 없이 실행된다. |
+| 획득 위치 | `try` 안 | `try` 바깥 | 획득에 실패하면 바로 예외로 끝내, 잡지 않은 락을 `finally`에서 해제하지 않게 한다. |
+
+- 락 대기가 3초를 넘으면 예외가 나므로, 부하가 큰 환경에서는 동시성 테스트가 예외로 실패할 수 있다. 조용히 틀린 값을 만드는 대신 실패를 드러내는 쪽을 택했다.
+
+**장단점**
+
+| 구분 | 내용 |
+|---|---|
+| 장점 | 행이 아닌 **임의의 이름**에 락을 걸 수 있다. 잠글 행이 없는 경우에도 쓸 수 있다. |
+| 장점 | Redis 같은 추가 인프라 없이 **DB만으로 분산 락**을 구현할 수 있다. |
+| 장점 | 락 획득 대기 시간(타임아웃)을 직접 지정할 수 있다. |
+| 단점 | 트랜잭션이 끝나도 자동으로 풀리지 않아 **직접 해제**해야 한다. 해제를 놓치면 세션이 끝날 때까지 남는다. |
+| 단점 | 락용·비즈니스용 커넥션을 함께 써서 **커넥션 사용량이 두 배**가 되고, 풀 고갈 위험이 있다. |
+| 단점 | 트랜잭션 분리(`REQUIRES_NEW`), 커넥션 고정 등 구현이 복잡하다. |
+| 단점 | DB마다 문법이 달라 DB에 종속된다. |
 
 ### 3. Redis
 

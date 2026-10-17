@@ -50,7 +50,7 @@ sequenceDiagram
 | 1 | Java | `synchronized`로 해결과 한계 확인 | 완료 | [`step1-java-synchronized`](../../tree/step1-java-synchronized) |
 | 2-1 | DB | Pessimistic Lock | 완료 | [`step2-1-db-pessimistic-lock`](../../tree/step2-1-db-pessimistic-lock) |
 | 2-2 | DB | Optimistic Lock (+ 재시도 Facade) | 완료 | [`step2-2-db-optimistic-lock`](../../tree/step2-2-db-optimistic-lock) |
-| 2-3 | DB | Named Lock | 예정 | |
+| 2-3 | DB | Named Lock | 완료 | [`step2-3-db-named-lock`](../../tree/step2-3-db-named-lock) |
 | 3-1 | Redis | Lettuce | 예정 | |
 | 3-2 | Redis | Redisson | 예정 | |
 
