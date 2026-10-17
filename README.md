@@ -1,57 +1,94 @@
-# 재고시스템으로 알아보는 동시성이슈 해결방법
+# 재고시스템으로 알아보는 동시성이슈 해결방법 — Redis (Lettuce)
 
-재고(stock)를 감소시키는 단순한 로직에 여러 요청이 동시에 들어오면 재고가 어떻게 어긋나는지 확인하고,
-Java·Database·Redis를 이용한 동시성 제어 방법을 차례로 구현하며 비교한다.
+재고 감소 로직에 동시 요청이 몰릴 때 생기는 Race Condition을 Redis `SET NX` 기반 spin lock(Lettuce)으로 해결한다.
 
-- 프로젝트 목적·요구사항·기술 스펙·구조·실행 방법·구현 상세는 [프로젝트 설명](docs/project.md)에 정리했다.
-- 강의: [인프런 — 재고시스템으로 알아보는 동시성이슈 해결방법](https://www.inflearn.com/course/%EB%8F%99%EC%8B%9C%EC%84%B1%EC%9D%B4%EC%8A%88-%EC%9E%AC%EA%B3%A0%EC%8B%9C%EC%8A%A4%ED%85%9C/dashboard?cid=328995)
-- 강의 소스: [sangyongchoi/stock-example](https://github.com/sangyongchoi/stock-example)
+- 이 브랜치(`step3-1-redis-lettuce`)는 Lettuce 단계까지의 결과물이다. 이후 단계는 `main` 브랜치에서 진행한다.
+- 실행 방법·테스트 방식은 [프로젝트 설명](docs/project.md)에 정리했다.
+- 강의: [인프런 — 재고시스템으로 알아보는 동시성이슈 해결방법](https://www.inflearn.com/course/%EB%8F%99%EC%8B%9C%EC%84%B1%EC%9D%B4%EC%8A%88-%EC%9E%AC%EA%B3%A0%EC%8B%9C%EC%8A%A4%ED%85%9C/dashboard?cid=328995) / 강의 소스: [sangyongchoi/stock-example](https://github.com/sangyongchoi/stock-example)
 
-## 동시성 이슈란 (Race Condition)
+## 문제: Race Condition
 
-- 둘 이상의 스레드가 **공유 데이터(재고)에 동시에 접근해 변경**하려 할 때 발생한다.
-- 재고 감소는 `조회 → 감소 → 저장` 세 단계로 이루어지는데, 한 스레드의 저장이 끝나기 전에 다른 스레드가 조회하면
-  두 스레드가 같은 값을 읽고 각각 1씩 빼서 저장하므로 **감소가 한 번 사라진다(갱신 손실)**.
-- 그래서 재고 100개에 100건을 동시에 요청해도 재고가 0이 되지 않는다.
+재고 감소는 `조회 → 감소 → 저장` 순서로 실행된다. 두 트랜잭션이 같은 값을 읽고 각자 저장하면 감소분 하나가 사라진다.
+그래서 재고 100개에 100건을 동시에 요청해도 0이 되지 않는다.
+
+## 해결: Redis 락 (Lettuce)
+
+Redis에 **키가 없을 때만 저장**(`SET NX`)해서, 키를 먼저 만든 요청만 락을 얻는다. 나머지는 100ms 쉬었다가 다시 시도한다(**spin lock**).
+Lettuce는 `spring-boot-starter-data-redis`의 기본 Redis 클라이언트로, 코드에 직접 드러나지 않고 `RedisTemplate` 아래에서 명령을 보낸다.
+
+```java
+// RedisLockRepository — 키가 없을 때만 저장 (만료 3초)
+public Boolean lock(Long key) {
+    return redisTemplate
+            .opsForValue()
+            .setIfAbsent(generateKey(key), "lock", Duration.ofMillis(3_000));
+}
+
+public Boolean unlock(Long key) {
+    return redisTemplate.delete(generateKey(key));
+}
+
+// LettuceLockStockFacade — 락 획득(재시도) → 재고 감소 → 락 해제
+public void decrease(Long id, Long quantity) {
+    while (!redisLockRepository.lock(id)) {
+        try {
+            Thread.sleep(100);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("락 대기 중 인터럽트가 발생했습니다. id=" + id, e);
+        }
+    }
+
+    try {
+        redisLockStockService.decrease(id, quantity);
+    } finally {
+        redisLockRepository.unlock(id);
+    }
+}
+
+// RedisLockStockService — synchronized 없이 트랜잭션만
+@Transactional
+public void decrease(Long id, Long quantity) {
+    Stock stock = stockRepository.findById(id).orElseThrow();
+    stock.decrease(quantity);
+    stockRepository.save(stock);
+}
+```
 
 ```mermaid
 sequenceDiagram
-    participant T1 as Thread-1
-    participant DB as Stock (quantity)
-    participant T2 as Thread-2
+    participant A as 요청 A
+    participant R as Redis
+    participant B as 요청 B
+    participant DB as MySQL
 
-    T1->>DB: 조회 (5)
-    T2->>DB: 조회 (5)
-    Note over T1: 5 - 1 = 4
-    Note over T2: 5 - 1 = 4
-    T1->>DB: 저장 (4)
-    T2->>DB: 저장 (4)
-    Note over DB: 기대값 3, 실제값 4 → 감소 1건 유실
+    A->>R: SET 1 lock EX 3 NX → OK (획득)
+    B->>R: SET 1 lock EX 3 NX → nil (실패)
+    Note over B: 100ms 대기 후 재시도
+    A->>DB: 조회 → 감소 → update → commit
+    A->>R: DEL 1 (해제)
+    B->>R: SET 1 lock EX 3 NX → OK (획득)
+    Note over B: 커밋된 수량을 읽는다
 ```
 
-해결의 핵심은 **한 번에 하나의 스레드만 `조회 → 감소 → 저장` 구간에 들어가도록** 하는 것이다.
+- 만료 시간을 함께 넘기면 `SETNX` + `EXPIRE` 두 명령이 아니라 `SET ... NX EX` **한 명령**으로 나간다(`redis-cli monitor`로 확인). 그래서 락 획득과 만료 설정이 원자적이다.
+- 만료가 있으므로 락을 잡은 서버가 죽어 해제하지 못해도 3초 뒤 풀린다.
 
-## 해결 방법 비교
+### 특이점: Redis 락 전용 서비스를 따로 둔다
 
-| 방법 | 방식 | 장점 | 단점 / 주의점 |
-|---|---|---|---|
-| `synchronized` | Java 언어 수준의 락 | 구현이 가장 간단 | 한 프로세스 안에서만 보장 → **서버가 2대 이상이면 무용**. `@Transactional`과 함께 쓰면 커밋 전에 락이 풀려 여전히 깨진다. |
-| Pessimistic Lock | DB 행에 배타 락 (`SELECT ... FOR UPDATE`) | 충돌이 잦을 때 Optimistic보다 성능이 나을 수 있고, 정합성이 확실함 | 락 대기로 인한 성능 저하, 데드락 주의 |
-| Optimistic Lock | `@Version` 컬럼으로 갱신 시 충돌 감지 | 별도 락을 잡지 않아 충돌이 적으면 빠름 | 충돌 시 **재시도 로직을 직접 구현**해야 함, 충돌이 잦으면 오히려 느림 |
-| Named Lock | MySQL `GET_LOCK` / `RELEASE_LOCK` (이름 기반 락) | 행이 아닌 임의의 이름에 락 → 분산 락 용도로 활용 가능 | 트랜잭션 종료 시 자동 해제되지 않아 **직접 해제**해야 함, 락 전용 커넥션 분리 권장 |
-| Redis — Lettuce | `SETNX` 기반 spin lock | 구현이 간단, 기본 Redis 클라이언트 | 락을 얻을 때까지 계속 재요청 → **Redis 부하** |
-| Redis — Redisson | pub/sub 기반 락 | 락 해제 시 알림을 받아 재시도 → Redis 부하가 적음, 락 획득 재시도·타임아웃 기본 제공 | 별도 라이브러리 필요, 사용법을 익혀야 함 |
+- `StockService.decrease`는 `synchronized`라서, 이를 호출하면 Redis 락이 없어도 JVM 안에서 이미 한 줄로 실행돼 **테스트가 통과해 버린다**. Redis 락을 검증할 수 없다.
+- 그래서 `synchronized` 없이 `@Transactional`만 붙인 `RedisLockStockService`를 만들었다. 동시 요청을 막는 것은 Redis 락뿐이다.
+- 서비스가 반환될 때 커밋되고, 그 뒤 Facade의 `finally`에서 락을 해제하므로 락 범위가 커밋을 감싼다.
 
-## 진행 상황
+### 주의: 락 소유자를 확인하지 않는다
 
-| 단계 | 수준 | 내용 | 상태 | 브랜치 |
-|---|---|---|---|---|
-| 0 | — | 재고 감소 로직 작성 + 동시 요청 테스트로 Race Condition 확인 | 완료 | — |
-| 1 | Java | `synchronized`로 해결과 한계 확인 | 완료 | [`step1-java-synchronized`](../../tree/step1-java-synchronized) |
-| 2-1 | DB | Pessimistic Lock | 완료 | [`step2-1-db-pessimistic-lock`](../../tree/step2-1-db-pessimistic-lock) |
-| 2-2 | DB | Optimistic Lock (+ 재시도 Facade) | 완료 | [`step2-2-db-optimistic-lock`](../../tree/step2-2-db-optimistic-lock) |
-| 2-3 | DB | Named Lock | 완료 | [`step2-3-db-named-lock`](../../tree/step2-3-db-named-lock) |
-| 3-1 | Redis | Lettuce | 완료 | [`step3-1-redis-lettuce`](../../tree/step3-1-redis-lettuce) |
-| 3-2 | Redis | Redisson | 예정 | |
+- `unlock`은 값을 확인하지 않고 `DEL`만 한다. 처리가 만료 시간(3초)을 넘기면 A의 락이 만료된 사이 B가 락을 얻고, A가 끝나며 **B의 락을 지울** 수 있다.
+- 제대로 하려면 값에 소유자 식별값(UUID 등)을 넣고, "값이 내 것일 때만 삭제"를 Lua 스크립트로 원자적으로 실행해야 한다. Redisson은 이 처리와 만료 연장(watchdog)을 기본으로 제공한다.
 
-각 단계를 구현하면 상태를 갱신하고 `step{수준}-{하위 번호}-{수준명}-{방법}` 브랜치로 결과를 남기며, 구현 상세는 [프로젝트 설명](docs/project.md#구현-상세)에 기록한다.
+### 장단점
+
+| 장점 | 단점 |
+|---|---|
+| `spring-boot-starter-data-redis`만 있으면 되고 **구현이 간단**하다. | 락을 얻을 때까지 계속 요청하는 spin lock이라 **Redis에 부하**를 준다(100건에 `SET` 875번). |
+| 락 대기에 **DB 커넥션을 쓰지 않는다**(Named Lock과의 차이). | 재시도 간격·만료 시간·소유자 확인 등을 **직접 구현**해야 한다. |
+| 여러 서버가 같은 Redis를 보므로 **분산 환경에서도 동작**한다. | 재시도 간격만큼 대기가 생겨 느리다(이 테스트에서 약 4.7초). |
