@@ -45,7 +45,7 @@ stock-concurrency
     │   ├── StockApplication
     │   ├── domain        # Stock(productId, quantity, @Version) — decrease()에서 수량 검증
     │   ├── repository    # StockRepository(비관적 락·낙관적 락 조회), LockRepository(Named Lock), RedisLockRepository(Lettuce)
-    │   ├── service       # StockService(synchronized), PessimisticLockStockService, OptimisticLockStockService
+    │   ├── service       # StockService(synchronized), PessimisticLockStockService, OptimisticLockStockService, NamedLockStockService, RedisLockStockService
     │   └── facade        # OptimisticLockStockFacade(재시도), NamedLockStockFacade, LettuceLockStockFacade, RedissonLockStockFacade
     └── test/java/com/example/stock
         └── ...           # 방법별 동시 요청 테스트 (100 스레드 → 재고 0 검증)
@@ -344,7 +344,82 @@ public void decrease(Long id, Long quantity) {
 
 #### 3-1. Lettuce
 
-_예정_ — `SETNX` spin lock, 획득 실패 시 잠시 대기 후 재시도
+Redis의 `SET NX`(키가 없을 때만 저장)로 락을 구현한다. 키를 먼저 만든 요청이 락을 얻고, 나머지는 잠시 쉬었다가 다시 시도한다(**spin lock**).
+Lettuce는 `spring-boot-starter-data-redis`의 기본 Redis 클라이언트로, 코드에 직접 드러나지 않고 `RedisTemplate` 아래에서 명령을 보낸다.
+접속 정보는 기본값(`localhost:6379`)을 쓰므로 `application.yaml`에 따로 설정하지 않았다.
+
+```java
+// RedisLockRepository — 키가 없을 때만 저장 (만료 3초)
+public Boolean lock(Long key) {
+    return redisTemplate
+            .opsForValue()
+            .setIfAbsent(generateKey(key), "lock", Duration.ofMillis(3_000));
+}
+
+public Boolean unlock(Long key) {
+    return redisTemplate.delete(generateKey(key));
+}
+
+// LettuceLockStockFacade — 락을 얻을 때까지 100ms 간격으로 재시도 → 재고 감소 → 락 해제
+public void decrease(Long id, Long quantity) {
+    while (!redisLockRepository.lock(id)) {
+        try {
+            Thread.sleep(100);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("락 대기 중 인터럽트가 발생했습니다. id=" + id, e);
+        }
+    }
+
+    try {
+        redisLockStockService.decrease(id, quantity);
+    } finally {
+        redisLockRepository.unlock(id);
+    }
+}
+
+// RedisLockStockService — synchronized 없이 트랜잭션만
+@Transactional
+public void decrease(Long id, Long quantity) {
+    Stock stock = stockRepository.findById(id).orElseThrow();
+    stock.decrease(quantity);
+    stockRepository.save(stock);
+}
+```
+
+테스트 중 `redis-cli monitor`로 확인한 실제 명령:
+
+```
+"SET" "1" "lock" "EX" "3" "NX"     ← 락 획득 시도 (만료와 NX를 한 명령으로 원자적으로 처리)
+"DEL" "1"                          ← 락 해제
+```
+
+- 만료 시간을 함께 넘기면 `SETNX` + `EXPIRE` 두 명령이 아니라 `SET ... NX EX` 한 명령으로 나간다. 두 명령으로 나누면 그 사이에 서버가 죽었을 때 만료 없는 락이 남는다.
+- 만료가 있으므로, 락을 잡은 서버가 죽어 `unlock`을 못 해도 3초 뒤 락이 풀린다.
+- 한 번 실행에서 `SET` 875번, `DEL` 100번이 나갔다. 락을 얻은 100번 외에 **775번은 획득 실패 후 재시도**한 요청이다.
+
+**특이점: Redis 락 전용 서비스(`RedisLockStockService`)를 따로 둔다**
+
+- `StockService.decrease`는 `synchronized`이므로, 이를 호출하면 Redis 락이 없어도 JVM 안에서 이미 한 줄로 실행돼 **테스트가 통과해 버린다**. 그러면 Redis 락을 검증할 수 없다.
+- 그래서 `synchronized` 없이 `@Transactional`만 붙인 `RedisLockStockService`를 만들었다. 동시 요청을 막는 것은 Redis 락뿐이다.
+- 서비스 메서드가 반환될 때 커밋되고, 그 뒤 Facade의 `finally`에서 락을 해제하므로 락 범위가 커밋을 감싼다.
+- 강의는 `StockService`의 `synchronized`를 빼고 `@Transactional`로 되돌려 재사용하지만, 이 프로젝트는 `synchronized` 단계 결과를 보존한다. 3-2 Redisson에서도 이 서비스를 쓴다.
+
+**주의: 락 소유자를 확인하지 않는다 (강의 코드와 같음)**
+
+- `unlock`은 값을 확인하지 않고 `DEL`만 한다. 처리가 만료 시간(3초)을 넘기면 A의 락이 만료된 사이 B가 락을 얻고, A가 끝나며 **B의 락을 지울** 수 있다.
+- 제대로 하려면 값에 소유자 식별값(UUID 등)을 넣고, "값이 내 것일 때만 삭제"를 Lua 스크립트로 원자적으로 실행해야 한다. Redisson은 이 처리와 만료 연장(watchdog)을 기본으로 제공한다.
+
+**장단점**
+
+| 구분 | 내용 |
+|---|---|
+| 장점 | `spring-boot-starter-data-redis`만 있으면 되고 **구현이 간단**하다. |
+| 장점 | 락을 DB가 아닌 Redis가 맡아 **DB 커넥션을 락 대기에 쓰지 않는다** (Named Lock과의 차이). |
+| 장점 | 여러 서버(인스턴스)가 같은 Redis를 보므로 **분산 환경에서도 동작**한다. |
+| 단점 | 락을 얻을 때까지 계속 요청하는 spin lock이라 **Redis에 부하**를 준다 (100건에 `SET` 875번). |
+| 단점 | 재시도 간격·만료 시간·소유자 확인 등을 **직접 구현**해야 한다. 만료 시간보다 처리가 길면 락이 풀릴 수 있다. |
+| 단점 | 재시도 간격(100ms)만큼 대기가 생겨 이 테스트에서는 다른 방법보다 느리다(약 4.7초). |
 
 #### 3-2. Redisson
 
