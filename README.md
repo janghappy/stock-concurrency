@@ -52,6 +52,6 @@ sequenceDiagram
 | 2-2 | DB | Optimistic Lock (+ 재시도 Facade) | 완료 | [`step2-2-db-optimistic-lock`](../../tree/step2-2-db-optimistic-lock) |
 | 2-3 | DB | Named Lock | 완료 | [`step2-3-db-named-lock`](../../tree/step2-3-db-named-lock) |
 | 3-1 | Redis | Lettuce | 완료 | [`step3-1-redis-lettuce`](../../tree/step3-1-redis-lettuce) |
-| 3-2 | Redis | Redisson | 예정 | |
+| 3-2 | Redis | Redisson | 완료 | [`step3-2-redis-redisson`](../../tree/step3-2-redis-redisson) |
 
 각 단계를 구현하면 상태를 갱신하고 `step{수준}-{하위 번호}-{수준명}-{방법}` 브랜치로 결과를 남기며, 구현 상세는 [프로젝트 설명](docs/project.md#구현-상세)에 기록한다.

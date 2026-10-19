@@ -43,6 +43,7 @@ stock-concurrency
 └── src
     ├── main/java/com/example/stock
     │   ├── StockApplication
+    │   ├── config        # RedisConfig(RedisTemplate이 Lettuce로 연결하도록 연결 팩토리 등록)
     │   ├── domain        # Stock(productId, quantity, @Version) — decrease()에서 수량 검증
     │   ├── repository    # StockRepository(비관적 락·낙관적 락 조회), LockRepository(Named Lock), RedisLockRepository(Lettuce)
     │   ├── service       # StockService(synchronized), PessimisticLockStockService, OptimisticLockStockService, NamedLockStockService, RedisLockStockService
@@ -347,6 +348,7 @@ public void decrease(Long id, Long quantity) {
 Redis의 `SET NX`(키가 없을 때만 저장)로 락을 구현한다. 키를 먼저 만든 요청이 락을 얻고, 나머지는 잠시 쉬었다가 다시 시도한다(**spin lock**).
 Lettuce는 `spring-boot-starter-data-redis`의 기본 Redis 클라이언트로, 코드에 직접 드러나지 않고 `RedisTemplate` 아래에서 명령을 보낸다.
 접속 정보는 기본값(`localhost:6379`)을 쓰므로 `application.yaml`에 따로 설정하지 않았다.
+3-2에서 Redisson starter를 추가한 뒤에도 `RedisTemplate`이 Lettuce로 연결되도록 `RedisConfig`에서 연결 팩토리를 직접 등록한다([3-2 특이점](#3-2-redisson) 참고).
 
 ```java
 // RedisLockRepository — 키가 없을 때만 저장 (만료 3초)
@@ -423,7 +425,174 @@ public void decrease(Long id, Long quantity) {
 
 #### 3-2. Redisson
 
-_예정_ — `RLock.tryLock(대기 시간, 점유 시간)`, pub/sub 기반
+Redisson이 제공하는 `RLock`으로 락을 건다. 락을 얻지 못한 요청은 Redis를 반복해서 두드리지 않고,
+**락 해제 알림(pub/sub)을 구독한 채 기다렸다가** 알림이 오면 다시 시도한다.
+
+```gradle
+implementation 'org.redisson:redisson-spring-boot-starter:3.18.0'
+```
+
+```java
+// RedissonLockStockFacade — 최대 10초 대기, 획득 후 1초 점유 → 재고 감소 → 락 해제
+public void decrease(Long id, Long quantity) {
+    RLock lock = redissonClient.getLock(id.toString());
+
+    boolean available;
+    try {
+        available = lock.tryLock(10, 1, TimeUnit.SECONDS);
+    } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new IllegalStateException("락 대기 중 인터럽트가 발생했습니다. id=" + id, e);
+    }
+
+    if (!available) {
+        throw new IllegalStateException("락 획득에 실패했습니다. id=" + id);
+    }
+
+    // 락을 얻은 경우에만 해제한다
+    try {
+        redisLockStockService.decrease(id, quantity);
+    } finally {
+        lock.unlock();
+    }
+}
+```
+
+재고 감소는 3-1과 같은 `RedisLockStockService`(`synchronized` 없이 `@Transactional`만)를 쓴다.
+
+테스트 중 `redis-cli monitor`로 확인한 실제 명령(요약):
+
+```
+"EVAL" "if (redis.call('exists', KEYS[1]) == 0) then redis.call('hincrby', KEYS[1], ARGV[2], 1); redis.call('pexpire', ...); return nil; end;
+        if (redis.call('hexists', KEYS[1], ARGV[2]) == 1) then ... return nil; end;
+        return redis.call('pttl', KEYS[1]);" "1" "1" "1000" "ddea5d7d-...:66"      ← 락 획득 시도
+"SUBSCRIBE" "redisson_lock__channel:{1}"                                          ← 해제 알림 채널 구독
+"EVAL" "if (redis.call('hexists', KEYS[1], ARGV[3]) == 0) then return nil; end;
+        local counter = redis.call('hincrby', KEYS[1], ARGV[3], -1);
+        if (counter > 0) then ... else redis.call('del', KEYS[1]); redis.call('publish', KEYS[2], ARGV[1]); return 1; end;"   ← 락 해제
+"publish" "redisson_lock__channel:{1}" "0"                                       ← 대기 중인 요청에 해제 알림
+```
+
+- 락은 문자열이 아니라 **Hash**다. 필드가 `클라이언트 UUID:스레드 ID`, 값이 획득 횟수라서 **소유자 확인**과 **재진입**이 된다.
+- 획득·해제가 모두 **Lua 스크립트(`EVAL`) 한 번**으로 원자적으로 실행된다. 해제 스크립트는 "내 락일 때만" 지우고 바로 `publish`한다.
+- 획득에 실패하면 스크립트가 남은 만료 시간(`pttl`)을 돌려준다. 클라이언트는 채널을 구독하고, 알림이 오거나 그 시간이 지나면 다시 시도한다.
+- 한 번 실행에서 획득 시도 `EVAL`은 **244번**(성공 100 + 재시도 144)이었다. 같은 조건의 Lettuce `SET` 875번보다 훨씬 적다.
+- `SUBSCRIBE`는 채널당 한 번만 나간다. 같은 JVM의 대기 요청들은 연결 하나의 구독을 공유한다.
+
+##### Lettuce(spin lock)와 Redisson(pub/sub) 비교
+
+**Lettuce — spin lock 재시도**
+
+락을 얻을 때까지 `SET NX`를 일정 간격(100ms)으로 계속 보낸다. 락이 언제 풀릴지 모르니 직접 물어보는 방식이다.
+
+```mermaid
+sequenceDiagram
+    participant A as 요청 A
+    participant R as Redis
+    participant B as 요청 B
+
+    A->>R: SET 1 lock NX EX 3
+    R-->>A: OK (락 획득)
+    B->>R: SET 1 lock NX EX 3
+    R-->>B: nil (실패)
+    Note over B: 100ms 대기
+    B->>R: SET 1 lock NX EX 3
+    R-->>B: nil (실패)
+    Note over B: 100ms 대기 … 반복
+    A->>R: DEL 1 (락 해제)
+    Note over B: 해제를 모르고 남은 대기 시간만큼 쉼
+    B->>R: SET 1 lock NX EX 3
+    R-->>B: OK (락 획득)
+```
+
+- 대기하는 요청 수 × (대기 시간 / 재시도 간격)만큼 Redis에 요청이 쌓인다.
+- 간격을 줄이면 Redis 부하가 커지고, 늘리면 락이 풀린 뒤에도 놀고 있는 시간이 길어진다.
+
+**Redisson — pub/sub**
+
+락을 얻지 못하면 해제 알림 채널을 구독하고 기다린다. 락을 가진 쪽이 해제하면서 `publish`하고, 알림을 받은 요청만 다시 시도한다.
+
+```mermaid
+sequenceDiagram
+    participant A as 요청 A
+    participant R as Redis
+    participant B as 요청 B
+
+    A->>R: EVAL 획득 스크립트
+    R-->>A: nil (락 획득)
+    B->>R: EVAL 획득 스크립트
+    R-->>B: pttl (실패, 남은 만료 시간)
+    B->>R: SUBSCRIBE redisson_lock__channel:{1}
+    Note over B: 알림 또는 pttl 만료까지 대기 (요청 없음)
+    A->>R: EVAL 해제 스크립트 (소유자 확인 → DEL → PUBLISH)
+    R-->>B: 해제 알림
+    B->>R: EVAL 획득 스크립트
+    R-->>B: nil (락 획득)
+```
+
+- 기다리는 동안 Redis에 요청을 보내지 않으므로 대기 요청이 많아도 Redis 부하가 거의 늘지 않는다.
+- 해제되는 즉시 알림을 받으므로 재시도 간격만큼 노는 시간이 없다. 이 테스트에서 Lettuce(약 4.7초)보다 빠르다(약 1.3초).
+
+| 구분 | Lettuce (spin lock) | Redisson (pub/sub) |
+|---|---|---|
+| 대기 방식 | 일정 간격으로 `SET NX` 재요청 | 해제 알림 채널 구독 후 대기 |
+| Redis 부하 | 대기 요청이 많을수록 큼 (100건에 `SET` 875번) | 작음 (100건에 획득 시도 244번) |
+| 락이 풀린 뒤 반응 | 재시도 간격만큼 늦음 | 알림을 받고 바로 재시도 |
+| 소유자 확인 | 직접 구현해야 함 (강의 코드는 없음) | 기본 제공 (`UUID:스레드 ID`) |
+| 재진입 | 안 됨 | 됨 (획득 횟수 카운트) |
+| 만료 연장 | 직접 구현해야 함 | watchdog 제공 (leaseTime을 지정하지 않을 때) |
+| 의존성 | `spring-boot-starter-data-redis`만 | Redisson 라이브러리 추가 |
+| 구현 난이도 | 로직을 직접 짜야 하지만 원리가 단순 | 코드는 짧지만 라이브러리 동작을 알아야 함 |
+
+**특이점: Redisson 버전을 Boot 2.7에 맞춘다 (`3.18.0`)**
+
+- starter는 버전마다 Spring Data Redis 연동 모듈을 하나 골라 가져온다. 처음 쓴 `3.23.2`는 Boot 3(Spring Data Redis 3.1)용 `redisson-spring-data-31`을 가져와,
+  Spring Data Redis 2.7.18인 이 프로젝트에서 `NoClassDefFoundError: ...RedissonConnection`이 났다.
+- `3.17.3 ~ 3.18.0`이 Boot 2.7용 `redisson-spring-data-27`을 가져오므로 그중 마지막인 `3.18.0`을 쓴다.
+- 최신 starter를 쓰고 싶다면 `redisson-spring-data-31`을 exclude하고 `redisson-spring-data-27`을 직접 추가하는 방법도 있다.
+
+**특이점: Redisson starter를 넣으면 `RedisTemplate`도 Redisson으로 연결된다 → `RedisConfig`로 Lettuce 유지**
+
+- `RedissonAutoConfiguration`은 Spring Boot의 `RedisAutoConfiguration`보다 먼저 실행되어 `RedissonConnectionFactory`를 `RedisConnectionFactory` 빈으로 등록한다.
+  Boot의 Lettuce 설정은 이 빈이 없을 때만 등록되므로 빠지고, `RedisTemplate`은 Redisson 클라이언트로 명령을 보내게 된다.
+- 이때 `RedisTemplate` 코드는 수정 없이 그대로 동작하고 보내는 명령(`SET NX`, `DEL`)도 같다. 바뀌는 건 **명령을 보내는 클라이언트**뿐이고,
+  pub/sub 대기·소유자 확인 같은 Redisson 락 기능은 `RLock`을 써야만 동작한다.
+- 3-1 Lettuce 테스트가 이름대로 Lettuce를 쓰도록, `spring.redis` 설정(`RedisProperties`)으로 `LettuceConnectionFactory`를 직접 등록했다.
+  그러면 Redisson의 연결 팩토리는 등록되지 않고, `RedissonClient`는 그대로 Redisson이 만든다.
+
+```java
+@Bean
+public LettuceConnectionFactory redisConnectionFactory(RedisProperties redisProperties) {
+    RedisStandaloneConfiguration configuration =
+            new RedisStandaloneConfiguration(redisProperties.getHost(), redisProperties.getPort());
+    configuration.setDatabase(redisProperties.getDatabase());
+    configuration.setPassword(RedisPassword.of(redisProperties.getPassword()));
+    return new LettuceConnectionFactory(configuration);
+}
+```
+
+**강의 소스와 다른 점**
+
+- `StockService`(`synchronized`) 대신 `RedisLockStockService`를 쓴다. `synchronized` 서비스를 호출하면 Redisson 락 없이도 테스트가 통과해 검증이 되지 않는다(3-1과 같은 이유).
+- 강의 코드는 `finally`에서 항상 `unlock()`한다. 락을 얻지 못했을 때(실패·인터럽트) 자기 것이 아닌 락을 풀려다 `IllegalMonitorStateException`이 나므로, **락을 얻은 뒤에만** try/finally로 해제한다.
+- 획득 실패 시 출력 후 `return`하면 감소가 조용히 빠지므로, 예외를 던져 테스트의 `join()`에서 드러나게 했다.
+
+**주의: leaseTime을 지정하면 watchdog이 꺼진다**
+
+- `tryLock(10, 1, SECONDS)`는 1초 뒤 락이 자동으로 풀린다. 처리가 1초를 넘으면 끝나기 전에 다른 요청이 락을 얻는다(이 테스트는 처리 시간이 짧아 문제없다).
+- `tryLock(대기 시간, TimeUnit)`처럼 leaseTime을 생략하면 watchdog이 기본 30초 만료를 처리 중에 계속 연장하고, 서버가 죽으면 연장이 멈춰 만료된다.
+
+**장단점**
+
+| 구분 | 내용 |
+|---|---|
+| 장점 | pub/sub으로 대기하므로 spin lock보다 **Redis 부하가 적다**. |
+| 장점 | 해제 알림을 받아 바로 재시도하므로 **대기 지연이 짧다** (이 테스트에서 약 1.3초). |
+| 장점 | 소유자 확인, 재진입, 대기·점유 시간, 만료 연장(watchdog)을 **라이브러리가 제공**해 직접 구현할 게 적다. |
+| 장점 | Lettuce와 마찬가지로 락을 Redis가 맡아 DB 커넥션을 쓰지 않고, **분산 환경에서도 동작**한다. |
+| 단점 | 별도 라이브러리가 필요하고, Spring Boot 버전에 맞는 버전을 골라야 한다. |
+| 단점 | starter의 자동 설정이 `RedisTemplate`의 연결까지 바꾸는 등 **라이브러리 동작을 이해**해야 한다. |
+| 단점 | leaseTime을 처리 시간보다 짧게 잡으면 락이 먼저 풀리는 등 옵션을 잘못 쓰면 정합성이 깨진다. |
 
 ## 남은 과제
 
